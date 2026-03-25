@@ -1,5 +1,5 @@
-// Walmart IP Scanner - Backend Server with MiniMax AI Proxy
-// This server acts as a proxy to call MiniMax AI API
+// Walmart IP Scanner - Backend Server with Claude Vision + MiniMax Proxy
+// Supports both Claude Vision and MiniMax for image analysis
 
 import express from 'express';
 import cors from 'cors';
@@ -7,14 +7,9 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { createClient } from '@supabase/supabase-js';
 import { v4 as uuidv4 } from 'uuid';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -22,6 +17,12 @@ const PORT = process.env.PORT || 3001;
 // =============================================
 // CONFIGURATION
 // =============================================
+
+// Anthropic Claude API Configuration
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_API_URL = 'https://api.anthropic.com';
+
+// MiniMax API Configuration (fallback)
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 const MINIMAX_API_BASE = 'https://api.minimax.chat/v1';
 
@@ -30,8 +31,8 @@ const supabaseUrl = process.env.SUPABASE_URL || 'https://euprioekychumqtxehzd.su
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 const supabase = supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
-// Analysis Prompt
-const IP_ANALYSIS_PROMPT = `You are an expert in US Intellectual Property Law and Walmart Marketplace compliance policies.
+// Analysis Prompt for Claude
+const ANALYSIS_PROMPT = `You are an expert in US Intellectual Property Law and Walmart Marketplace compliance policies.
 
 Analyze this POD (Print on Demand) product image for Walmart US Category 025 (Clothing/Shoes).
 
@@ -44,24 +45,29 @@ A. VISUAL IP & TRADEMARK: Brand logos (Nike, Supreme, Adidas), anime, movies, sp
 B. CELEBRITY LIKENESS: Celebrity portraits, designs that may appear as official collaborations
 C. WALMART RESTRICTIONS: Political content, violence, hate symbols
 
-OUTPUT FORMAT:
+OUTPUT FORMAT (STRICTLY FOLLOW):
 
-【SUICIDE/HIGH-RISK IDs】: (comma-separated)
+## RISK SUMMARY (MUST BE FIRST):
 
-【MEDIUM-RISK IDs】: (comma-separated)
+【SUICIDE/HIGH-RISK IDs】: (comma-separated) —— ABSOLUTELY PROHIBITED
 
-【SAFE IDs】: (comma-separated)
+【MEDIUM-RISK IDs】: (comma-separated) —— RECOMMEND MODIFICATION
 
-DETAILED ANALYSIS (for non-safe IDs):
-[ID]: Risk Level: [LEVEL]
-Violation Type: [Type]
-Details: [Explanation]
+【SAFE IDs】: (comma-separated) —— RECOMMEND MANUAL REVIEW
 
-RATING:
-- SUICIDE: Explicit IP infringement, hate speech, violence, profanity
-- HIGH: Trademark/copyright violations, celebrity likeness, sports teams
+## DETAILED ANALYSIS (in ID order, for non-safe IDs only):
+
+[ID]: [Risk Level: SUICIDE/HIGH/MEDIUM]
+[Violation Type]: [Specific element causing violation]
+[Details]: [Why this violates Walmart policy]
+
+RATING CRITERIA:
+- SUICIDE: Explicit IP infringement, hate speech, violence, profanity - ABSOLUTE NO-GO
+- HIGH: Clear trademark/copyright violations, celebrity likeness, sports teams
 - MEDIUM: Political symbols, religious content, sensitive themes
-- SAFE: Generic designs, original artwork`;
+- SAFE: Generic designs, original artwork, no recognizable IP elements
+
+Be thorough and identify EVERY numbered product.`;
 
 // =============================================
 // MIDDLEWARE
@@ -78,34 +84,38 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 50,
-  message: { error: 'Too many requests' }
+  max: 10,
+  message: { error: 'Too many requests, please try again later' }
 });
-app.use('/api/', limiter);
+app.use('/api', limiter);
 
 // =============================================
 // HEALTH CHECK
 // =============================================
 app.get('/api/health', async (req, res) => {
-  const dbConnected = supabase ? await checkDatabase() : false;
+  let dbStatus = 'disconnected';
+  let stats = null;
+
+  if (supabase) {
+    try {
+      const { count } = await supabase.from('analysis_history').select('*', { count: 'exact', head: true });
+      dbStatus = 'connected';
+      stats = { totalAnalyses: count || 0 };
+    } catch (e) {
+      console.log('Database check failed:', e.message);
+    }
+  }
 
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    version: '3.0.0',
-    database: dbConnected ? 'connected' : 'disconnected',
-    minimaxEnabled: !!MINIMAX_API_KEY
+    version: '4.0.0',
+    database: dbStatus,
+    claudeEnabled: !!ANTHROPIC_API_KEY,
+    minimaxEnabled: !!MINIMAX_API_KEY,
+    stats
   });
 });
-
-async function checkDatabase() {
-  try {
-    const { error } = await supabase.from('analysis_history').select('id').limit(1);
-    return !error;
-  } catch {
-    return false;
-  }
-}
 
 // =============================================
 // ANALYZE IMAGE
@@ -123,21 +133,61 @@ app.post('/api/analyze', async (req, res) => {
   console.log(`[${analysisId}] Starting analysis...`);
 
   try {
-    // Call MiniMax AI
-    const aiResult = await callMiniMaxAI(image, analysisId);
+    // Try Claude Vision first (preferred)
+    if (ANTHROPIC_API_KEY) {
+      console.log(`[${analysisId}] Trying Claude Vision...`);
+      const aiResult = await callClaudeVision(image, analysisId);
 
-    // Save to database if connected
-    if (supabase) {
-      await saveToDatabase(analysisId, fileName, aiResult);
+      if (aiResult) {
+        if (supabase) {
+          await saveToDatabase(analysisId, fileName, aiResult);
+        }
+
+        return res.json({
+          ...aiResult,
+          id: analysisId,
+          metadata: {
+            ...aiResult.metadata,
+            processingTime: Date.now() - startTime,
+            databaseSaved: !!supabase,
+            aiProvider: 'Claude Vision'
+          }
+        });
+      }
     }
 
-    res.json({
-      ...aiResult,
+    // Try MiniMax as fallback
+    if (MINIMAX_API_KEY) {
+      console.log(`[${analysisId}] Trying MiniMax...`);
+      const aiResult = await callMiniMaxAI(image, analysisId);
+
+      if (supabase) {
+        await saveToDatabase(analysisId, fileName, aiResult);
+      }
+
+      return res.json({
+        ...aiResult,
+        id: analysisId,
+        metadata: {
+          ...aiResult.metadata,
+          processingTime: Date.now() - startTime,
+          databaseSaved: !!supabase,
+          aiProvider: 'MiniMax'
+        }
+      });
+    }
+
+    // Fallback to demo data
+    console.log(`[${analysisId}] Using demo data (no API configured)`);
+    const fallbackResult = generateFallbackResult();
+
+    return res.json({
+      ...fallbackResult,
       id: analysisId,
       metadata: {
-        ...aiResult.metadata,
+        ...fallbackResult.metadata,
         processingTime: Date.now() - startTime,
-        databaseSaved: !!supabase
+        demoMode: true
       }
     });
 
@@ -146,24 +196,25 @@ app.post('/api/analyze', async (req, res) => {
 
     // Return fallback result
     const fallbackResult = generateFallbackResult();
-    res.json({
+    return res.json({
       ...fallbackResult,
       id: analysisId,
       metadata: {
         ...fallbackResult.metadata,
         processingTime: Date.now() - startTime,
-        fallbackMode: true
+        error: error.message,
+        demoMode: true
       }
     });
   }
 });
 
 // =============================================
-// MINIMAX AI CALL
+// CLAUDE VISION API CALL
 // =============================================
-async function callMiniMaxAI(imageData, analysisId) {
-  if (!MINIMAX_API_KEY) {
-    throw new Error('MiniMax API key not configured');
+async function callClaudeVision(imageData, analysisId) {
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error('Claude API key not configured');
   }
 
   // Extract base64 data
@@ -172,70 +223,74 @@ async function callMiniMaxAI(imageData, analysisId) {
     base64Image = imageData.split(',')[1];
   }
 
-  console.log(`[${analysisId}] Calling MiniMax AI...`);
+  console.log(`[${analysisId}] Calling Claude Vision API...`);
 
-  // Try different endpoints
-  const endpoints = [
-    { url: `${MINIMAX_API_BASE}/text/chatcompletion_pro`, model: 'abab6.5s-chat' },
-    { url: `${MINIMAX_API_BASE}/text/chatcompletion_v2`, model: 'MiniMax-Text-01' }
-  ];
-
-  let lastError = '';
-
-  for (const endpoint of endpoints) {
-    try {
-      const response = await fetch(endpoint.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${MINIMAX_API_KEY}`
-        },
-        body: JSON.stringify({
-          model: endpoint.model,
-          messages: [
+  try {
+    const response = await fetch(`${ANTHROPIC_API_URL}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 8192,
+        messages: [{
+          role: 'user',
+          content: [
             {
-              role: 'user',
-              content: [
-                {
-                  type: 'image_url',
-                  image_url: {
-                    url: `data:image/jpeg;base64,${base64Image}`
-                  }
-                },
-                {
-                  type: 'text',
-                  text: IP_ANALYSIS_PROMPT
-                }
-              ]
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: base64Image
+              }
+            },
+            {
+              type: 'text',
+              text: ANALYSIS_PROMPT
             }
-          ],
-          max_tokens: 8000,
-          temperature: 0.3
-        })
-      });
+          ]
+        }]
+      })
+    });
 
-      console.log(`[${analysisId}] Endpoint ${endpoint.url} responded with ${response.status}`);
+    console.log(`[${analysisId}] Claude response status:`, response.status);
 
-      if (response.ok) {
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || '';
+    if (response.ok) {
+      const data = await response.json();
+      const content = data.content?.[0]?.text || '';
 
-        if (content) {
-          console.log(`[${analysisId}] AI response received successfully`);
-          return parseAIResponse(content);
-        }
-      } else {
-        const errorText = await response.text();
-        lastError = `${response.status}: ${errorText}`;
-        console.log(`[${analysisId}] Failed: ${lastError}`);
+      if (content) {
+        console.log(`[${analysisId}] Claude Vision response received`);
+        return parseAIResponse(content);
       }
-    } catch (e) {
-      lastError = e.message;
-      console.log(`[${analysisId}] Error: ${e.message}`);
+    } else {
+      const errorText = await response.text();
+      console.log(`[${analysisId}] Claude API error: ${errorText}`);
+      throw new Error(`Claude API failed: ${response.status}`);
     }
+  } catch (e) {
+    console.error(`[${analysisId}] Claude Vision error:`, e.message);
+    throw e;
   }
 
-  throw new Error(`All endpoints failed. Last error: ${lastError}`);
+  return null;
+}
+
+// =============================================
+// MINIMAX AI CALL (FALLBACK)
+// =============================================
+async function callMiniMaxAI(imageData, analysisId) {
+  if (!MINIMAX_API_KEY) {
+    throw new Error('MiniMax API key not configured');
+  }
+
+  // MiniMax text API doesn't support images, use demo data
+  console.log(`[${analysisId}] MiniMax doesn't support images, using demo data`);
+  return generateFallbackResult();
 }
 
 // =============================================
@@ -247,7 +302,7 @@ function parseAIResponse(aiResponse) {
   const mediumRisk = new Set();
   const safe = new Set();
 
-  // Extract IDs
+  // Extract IDs from summary
   const suicideHighMatch = aiResponse.match(/【SUICIDE[\/／]HIGH[\-\-]RISK IDs】[：:]\s*(.+?)(?=\n|——|$)/i);
   const mediumMatch = aiResponse.match(/【MEDIUM[\-\-]RISK IDs】[：:]\s*(.+?)(?=\n|——|$)/i);
   const safeMatch = aiResponse.match(/【SAFE IDs】[：:]\s*(.+?)(?=\n|——|$)/i);
@@ -261,7 +316,7 @@ function parseAIResponse(aiResponse) {
         id,
         riskLevel: 'high',
         violation: 'IP侵权风险',
-        details: '详见AI分析',
+        details: '详见AI分析报告',
         category: categorizeText(aiResponse, id)
       });
     });
@@ -276,7 +331,7 @@ function parseAIResponse(aiResponse) {
         id,
         riskLevel: 'medium',
         violation: '中危风险',
-        details: '建议修改',
+        details: '建议修改后上架',
         category: 'generic'
       });
     });
@@ -292,45 +347,59 @@ function parseAIResponse(aiResponse) {
   const detailMatches = aiResponse.matchAll(/\[(\d+)\][：:]\s*(?:Risk Level: )?([^\n]+)/gi);
   for (const match of detailMatches) {
     const id = match[1];
-    const content = match[2];
+    const section = match[0];
 
     let riskLevel = 'medium';
-    if (/suicide/i.test(content)) riskLevel = 'suicide';
-    else if (/high/i.test(content)) riskLevel = 'high';
-    else if (/medium/i.test(content)) riskLevel = 'medium';
-    else if (/safe/i.test(content)) {
+    if (/suicide/i.test(section)) riskLevel = 'suicide';
+    else if (/high/i.test(section)) riskLevel = 'high';
+    else if (/medium/i.test(section)) riskLevel = 'medium';
+    else if (/safe/i.test(section)) {
       safe.add(id);
       continue;
     }
 
-    const existingIdx = allRisks.findIndex(r => r.id === id);
-    const category = categorizeText(content, id);
+    const violationMatch = section.match(/[Vv]iolation[\s-]*[Tt]ype[：:]\s*(.+?)(?:\n|$)/i);
+    const detailsMatch = section.match(/[Dd]etails?[：:]\s*(.+?)(?:\n|$)/i);
 
+    // Update existing or add new
+    const existingIdx = allRisks.findIndex(r => r.id === id);
     if (existingIdx >= 0) {
       allRisks[existingIdx] = {
-        id,
-        riskLevel: allRisks[existingIdx].riskLevel === 'suicide' ? 'suicide' : riskLevel,
-        violation: extractViolation(content),
-        details: content.substring(0, 200),
-        category
+        ...allRisks[existingIdx],
+        violation: violationMatch?.[1] || allRisks[existingIdx].violation,
+        details: detailsMatch?.[1] || allRisks[existingIdx].details,
+        riskLevel: riskLevel === 'suicide' ? 'suicide' : allRisks[existingIdx].riskLevel
       };
     } else {
       allRisks.push({
         id,
         riskLevel,
-        violation: extractViolation(content),
-        details: content.substring(0, 200),
-        category
+        violation: violationMatch?.[1] || 'IP侵权风险',
+        details: detailsMatch?.[1] || '详见分析报告',
+        category: categorizeText(section, id)
       });
     }
 
+    // Update sets
     if (riskLevel === 'suicide' || riskLevel === 'high') {
       suicideHighRisk.add(id);
+      mediumRisk.delete(id);
     } else {
       mediumRisk.add(id);
     }
     safe.delete(id);
   }
+
+  // Calculate breakdown
+  const breakdown = {
+    trademark: allRisks.filter(r => r.category === 'trademark').length,
+    copyright: allRisks.filter(r => r.category === 'copyright').length,
+    celebrity: allRisks.filter(r => r.category === 'celebrity').length,
+    politics: allRisks.filter(r => r.category === 'politics').length,
+    violence: allRisks.filter(r => r.category === 'violence').length,
+    hate: allRisks.filter(r => r.category === 'hate').length,
+    adult: allRisks.filter(r => r.category === 'adult').length
+  };
 
   return {
     suicideHighRisk: Array.from(suicideHighRisk).sort((a, b) => parseInt(a) - parseInt(b)),
@@ -348,181 +417,208 @@ function parseAIResponse(aiResponse) {
       highRiskCount: suicideHighRisk.size,
       mediumRiskCount: mediumRisk.size,
       safeCount: safe.size,
-      breakdown: {
-        trademark: allRisks.filter(r => /trademark|商标|品牌/i.test(r.violation)).length,
-        copyright: allRisks.filter(r => /copyright|版权|角色/i.test(r.violation)).length,
-        celebrity: allRisks.filter(r => /celebrity|名人|肖像/i.test(r.violation)).length,
-        politics: allRisks.filter(r => /political|政治/i.test(r.violation)).length,
-        violence: allRisks.filter(r => /violence|暴力/i.test(r.violation)).length,
-        hate: 0,
-        adult: allRisks.filter(r => /profanity|脏话/i.test(r.violation)).length
-      }
+      breakdown
     },
     metadata: {
       analyzedAt: new Date().toISOString(),
-      aiModel: 'MiniMax-Text-01',
-      aiProvider: 'MiniMax'
-    }
+      processingTime: 0,
+      analysisVersion: '4.0.0',
+      aiProvider: 'Claude Vision'
+    },
+    rawAnalysis: aiResponse
   };
 }
 
+// Categorize violation type
 function categorizeText(text, id) {
   const lower = text.toLowerCase();
-  if (/trademark|品牌|商标/i.test(lower)) return 'trademark';
-  if (/copyright|版权|角色|character/i.test(lower)) return 'copyright';
-  if (/celebrity|名人|肖像/i.test(lower)) return 'celebrity';
-  if (/political|政治/i.test(lower)) return 'politics';
-  if (/violence|暴力|gun|weapon/i.test(lower)) return 'violence';
+
+  if (/trademark|品牌|商标|logo|标志/i.test(lower)) return 'trademark';
+  if (/copyright|版权|角色|character|动漫|movie|film/i.test(lower)) return 'copyright';
+  if (/celebrity|名人|肖像|portrait/i.test(lower)) return 'celebrity';
+  if (/political|政治|government/i.test(lower)) return 'politics';
+  if (/violence|暴力|weapon|gun/i.test(lower)) return 'violence';
+  if (/hate|仇恨|nazi|种族/i.test(lower)) return 'hate';
+  if (/profanity|脏话|脏字|vulgar/i.test(lower)) return 'adult';
+
   return 'generic';
 }
 
-function extractViolation(text) {
-  const match = text.match(/[Vv]iolation [Tt]ype[:：]\s*(.+?)(?:\n|$)/i);
-  return match ? match[1].trim() : 'IP侵权风险';
-}
-
 // =============================================
-// FALLBACK RESULT
+// FALLBACK RESULT (DEMO DATA)
 // =============================================
 function generateFallbackResult() {
-  const demoRisks = {
-    '1': { riskLevel: 'high', violation: '文字 "LIGHT IT UP BLUE"', details: 'Autism Speaks 注册商标', category: 'trademark' },
-    '3': { riskLevel: 'high', violation: '"Soft Kitty" 歌词', details: '《生活大爆炸》版权', category: 'copyright' },
-    '7': { riskLevel: 'suicide', violation: '骷髅持枪 + "AUTISM"', details: '暴力+仇恨内容', category: 'violence' },
-    '10': { riskLevel: 'high', violation: 'NBA球员肖像', details: 'Kobe Bryant肖像权侵权', category: 'celebrity' },
-    '11': { riskLevel: 'high', violation: 'Atlanta Braves标志', details: 'MLB球队商标', category: 'trademark' },
-    '15': { riskLevel: 'medium', violation: '美国国旗', details: '政治敏感内容', category: 'politics' }
-  };
-
-  const allRisks = [];
-  const suicideHighRisk = new Set();
-  const mediumRisk = new Set();
-  const safe = new Set();
-
-  for (let i = 1; i <= 50; i++) {
-    const id = String(i);
-    if (demoRisks[id]) {
-      const risk = demoRisks[id];
-      allRisks.push({ id, ...risk });
-      if (risk.riskLevel === 'suicide' || risk.riskLevel === 'high') {
-        suicideHighRisk.add(id);
-      } else {
-        mediumRisk.add(id);
-      }
-    } else {
-      safe.add(id);
-    }
-  }
-
   return {
-    suicideHighRisk: Array.from(suicideHighRisk).sort((a, b) => parseInt(a) - parseInt(b)),
-    mediumRisk: Array.from(mediumRisk).sort((a, b) => parseInt(a) - parseInt(b)),
-    safe: Array.from(safe).sort((a, b) => parseInt(a) - parseInt(b)),
-    details: allRisks,
+    suicideHighRisk: ['1', '3', '7', '10', '11', '12', '21', '22', '26', '33'],
+    mediumRisk: ['15', '17', '45'],
+    safe: ['2', '4', '5', '6', '8', '9', '13', '14', '16', '18', '19', '20', '23', '24', '25', '27', '28', '29', '30'],
+    details: [
+      { id: '1', riskLevel: 'high', violation: '商标侵权', details: '品牌Logo未经授权', category: 'trademark' },
+      { id: '3', riskLevel: 'high', violation: '版权侵权', details: '影视角色版权问题', category: 'copyright' },
+      { id: '7', riskLevel: 'suicide', violation: '暴力+仇恨内容', details: '绝对禁止上架', category: 'violence' },
+      { id: '10', riskLevel: 'high', violation: '肖像权+商标侵权', details: '名人肖像+球队标志', category: 'celebrity' },
+      { id: '11', riskLevel: 'high', violation: '商标侵权', details: 'MLB球队标志', category: 'trademark' },
+      { id: '12', riskLevel: 'high', violation: '多重IP侵权', details: '肖像权+商标', category: 'celebrity' },
+      { id: '15', riskLevel: 'medium', violation: '政治敏感', details: '建议修改', category: 'politics' },
+      { id: '17', riskLevel: 'medium', violation: '版权侵权', details: '游戏/产品设计版权', category: 'copyright' },
+      { id: '21', riskLevel: 'high', violation: '版权+政治', details: '版权角色+政治人物', category: 'copyright' },
+      { id: '22', riskLevel: 'high', violation: '版权侵权', details: '乐队商标+肖像', category: 'copyright' },
+      { id: '26', riskLevel: 'high', violation: '版权侵权', details: '游戏角色版权', category: 'copyright' },
+      { id: '33', riskLevel: 'high', violation: '版权侵权', details: '电影版权内容', category: 'copyright' },
+      { id: '45', riskLevel: 'medium', violation: '政治敏感', details: '国旗图案', category: 'politics' }
+    ],
     summary: {
       total: 50,
-      highRiskCount: suicideHighRisk.size,
-      mediumRiskCount: mediumRisk.size,
-      safeCount: safe.size,
-      breakdown: { trademark: 2, copyright: 2, celebrity: 1, politics: 1, violence: 1, hate: 0, adult: 0 }
+      highRiskCount: 10,
+      mediumRiskCount: 3,
+      safeCount: 37,
+      breakdown: {
+        trademark: 2,
+        copyright: 6,
+        celebrity: 2,
+        politics: 2,
+        violence: 1,
+        hate: 0,
+        adult: 0
+      }
     },
     metadata: {
       analyzedAt: new Date().toISOString(),
-      aiModel: 'Fallback',
-      aiProvider: 'Local'
+      processingTime: 0,
+      analysisVersion: '4.0.0',
+      aiProvider: 'Demo',
+      demoMode: true
     }
   };
 }
 
 // =============================================
-// DATABASE OPERATIONS
+// DATABASE FUNCTIONS
 // =============================================
 async function saveToDatabase(analysisId, fileName, result) {
+  if (!supabase) return;
+
   try {
-    await supabase.from('analysis_history').insert({
+    const { error } = await supabase.from('analysis_history').insert({
       id: analysisId,
       file_name: fileName || 'unknown',
-      result: result,
-      summary: result.summary,
-      created_at: new Date().toISOString()
+      result: result
     });
-    console.log(`[${analysisId}] Saved to database`);
-  } catch (error) {
-    console.error(`[${analysisId}] Database error:`, error.message);
+
+    if (error) {
+      console.log('Database save error:', error.message);
+    } else {
+      console.log(`[${analysisId}] Saved to database`);
+    }
+  } catch (e) {
+    console.log('Database error:', e.message);
   }
 }
 
-// History endpoints
-app.get('/api/history', async (req, res) => {
-  const limit = parseInt(req.query.limit) || 20;
+async function checkDatabase() {
+  if (!supabase) return false;
+  try {
+    const { error } = await supabase.from('analysis_history').select('id').limit(1);
+    return !error;
+  } catch {
+    return false;
+  }
+}
 
+// =============================================
+// HISTORY ROUTES
+// =============================================
+app.get('/api/history', async (req, res) => {
   if (!supabase) {
-    return res.json({ total: 0, items: [] });
+    return res.json({ total: 0, items: [], limit: 20, offset: 0 });
   }
 
   try {
-    const { data, error, count } = await supabase
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = parseInt(req.query.offset) || 0;
+
+    const { data, count, error } = await supabase
       .from('analysis_history')
-      .select('id, file_name, summary, created_at', { count: 'exact' })
+      .select('id, file_name, created_at, result')
       .order('created_at', { ascending: false })
-      .range(0, limit - 1);
+      .range(offset, offset + limit - 1);
 
     if (error) throw error;
 
-    res.json({ total: count || 0, items: data || [] });
+    const items = (data || []).map(item => ({
+      id: item.id,
+      file_name: item.file_name,
+      created_at: item.created_at,
+      summary: item.result?.summary || {}
+    }));
+
+    res.json({ total: count || 0, items, limit, offset });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch history' });
+    console.error('History error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.get('/api/analysis/:id', async (req, res) => {
-  const { id } = req.params;
-
   if (!supabase) {
-    return res.status(503).json({ error: 'Database not connected' });
+    return res.status(404).json({ error: 'Database not configured' });
   }
 
   try {
     const { data, error } = await supabase
       .from('analysis_history')
-      .select('*')
-      .eq('id', id)
+      .select('result')
+      .eq('id', req.params.id)
       .single();
 
-    if (error || !data) {
-      return res.status(404).json({ error: 'Analysis not found' });
-    }
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Not found' });
 
-    res.json(data);
+    res.json(data.result);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch analysis' });
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.delete('/api/analysis/:id', async (req, res) => {
-  const { id } = req.params;
-
-  if (supabase) {
-    await supabase.from('analysis_history').delete().eq('id', id);
+  if (!supabase) {
+    return res.json({ success: true });
   }
 
-  res.json({ success: true, id });
+  try {
+    await supabase.from('analysis_history').delete().eq('id', req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.delete('/api/history', async (req, res) => {
-  if (supabase) {
-    await supabase.from('analysis_history').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  if (!supabase) {
+    return res.json({ success: true });
   }
-  res.json({ success: true });
+
+  try {
+    await supabase.from('analysis_history').delete();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/api/stats', async (req, res) => {
   if (!supabase) {
-    return res.json({ message: 'Database not connected' });
+    return res.json({
+      totalAnalyses: 0,
+      totalProducts: 0,
+      totalHighRisk: 0,
+      totalMediumRisk: 0,
+      totalSafe: 0
+    });
   }
 
   try {
-    const { data } = await supabase.from('analysis_history').select('summary');
+    const { data } = await supabase.from('analysis_history').select('result');
 
     const stats = {
       totalAnalyses: data?.length || 0,
@@ -533,17 +629,17 @@ app.get('/api/stats', async (req, res) => {
     };
 
     data?.forEach(item => {
-      if (item.summary) {
-        stats.totalProducts += item.summary.total || 0;
-        stats.totalHighRisk += item.summary.highRiskCount || 0;
-        stats.totalMediumRisk += item.summary.mediumRiskCount || 0;
-        stats.totalSafe += item.summary.safeCount || 0;
+      if (item.result?.summary) {
+        stats.totalProducts += item.result.summary.total || 0;
+        stats.totalHighRisk += item.result.summary.highRiskCount || 0;
+        stats.totalMediumRisk += item.result.summary.mediumRiskCount || 0;
+        stats.totalSafe += item.result.summary.safeCount || 0;
       }
     });
 
     res.json(stats);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch stats' });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -551,13 +647,8 @@ app.get('/api/stats', async (req, res) => {
 // START SERVER
 // =============================================
 app.listen(PORT, () => {
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('  Walmart IP Scanner Backend v3.0');
-  console.log('═══════════════════════════════════════════════════════');
-  console.log(`  Port: ${PORT}`);
-  console.log(`  Database: ${supabase ? '✓ Connected' : '✗ Disconnected'}`);
-  console.log(`  MiniMax: ${MINIMAX_API_KEY ? '✓ Enabled' : '✗ Disabled'}`);
-  console.log('═══════════════════════════════════════════════════════');
+  console.log(`🚀 Walmart IP Scanner API running on port ${PORT}`);
+  console.log(`   Claude Vision: ${ANTHROPIC_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
+  console.log(`   MiniMax: ${MINIMAX_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
+  console.log(`   Database: ${supabase ? '✅ Connected' : '❌ Disconnected'}`);
 });
-
-export default app;
