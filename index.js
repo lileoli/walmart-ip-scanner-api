@@ -20,7 +20,14 @@ const PORT = process.env.PORT || 3001;
 
 // Google Gemini API Configuration (Primary)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash';
+// Try multiple model endpoints - some API keys work with different versions
+const GEMINI_MODELS = [
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro-latest',
+  'gemini-1.5-pro',
+  'gemini-pro-vision'
+];
 
 // Anthropic Claude API Configuration (Fallback)
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -229,59 +236,74 @@ async function callGeminiVision(imageData, analysisId) {
     base64Image = imageData.split(',')[1];
   }
 
-  console.log(`[${analysisId}] Calling Gemini Vision API...`);
+  const baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-  try {
-    const response = await fetch(
-      `${GEMINI_API_URL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              {
-                inlineData: {
-                  mimeType: 'image/jpeg',
-                  data: base64Image
+  // Try each model until one works
+  for (const model of GEMINI_MODELS) {
+    console.log(`[${analysisId}] Trying Gemini model: ${model}`);
+
+    try {
+      const response = await fetch(
+        `${baseUrl}/${model}:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: 'image/jpeg',
+                    data: base64Image
+                  }
+                },
+                {
+                  text: ANALYSIS_PROMPT
                 }
-              },
-              {
-                text: ANALYSIS_PROMPT
-              }
-            ]
-          }],
-          generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 8192
-          }
-        })
+              ]
+            }],
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 8192
+            }
+          })
+        }
+      );
+
+      console.log(`[${analysisId}] ${model} response status:`, response.status);
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+        if (content) {
+          console.log(`[${analysisId}] Gemini Vision response received from ${model}`);
+          return parseAIResponse(content, `Gemini Vision (${model})`);
+        }
+      } else {
+        const errorText = await response.text();
+        const errorData = JSON.parse(errorText);
+
+        // If model not found, try next model
+        if (errorData.error?.code === 404) {
+          console.log(`[${analysisId}] Model ${model} not found, trying next...`);
+          continue;
+        }
+
+        // For other errors, log and continue to next model
+        console.log(`[${analysisId}] ${model} error: ${errorText}`);
+        continue;
       }
-    );
-
-    console.log(`[${analysisId}] Gemini response status:`, response.status);
-
-    if (response.ok) {
-      const data = await response.json();
-      const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-      if (content) {
-        console.log(`[${analysisId}] Gemini Vision response received`);
-        return parseAIResponse(content, 'Gemini Vision');
-      }
-    } else {
-      const errorText = await response.text();
-      console.log(`[${analysisId}] Gemini API error: ${errorText}`);
-      throw new Error(`Gemini API failed: ${response.status}`);
+    } catch (e) {
+      console.error(`[${analysisId}] ${model} error:`, e.message);
+      continue;
     }
-  } catch (e) {
-    console.error(`[${analysisId}] Gemini Vision error:`, e.message);
-    throw e;
   }
 
-  return null;
+  // All models failed
+  throw new Error('All Gemini models failed');
 }
 
 // =============================================
