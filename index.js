@@ -1,5 +1,5 @@
-// Walmart IP Scanner - Backend Server with Gemini Vision + Claude + MiniMax Proxy
-// Supports Gemini Vision (primary), Claude Vision, and MiniMax for image analysis
+// Walmart IP Scanner - Backend Server with GPT-4 Vision + Gemini + Claude Proxy
+// Supports GPT-4 Vision (primary), Gemini Vision, and Claude Vision for image analysis
 
 import express from 'express';
 import cors from 'cors';
@@ -18,9 +18,12 @@ const PORT = process.env.PORT || 3001;
 // CONFIGURATION
 // =============================================
 
-// Google Gemini API Configuration (Primary)
+// OpenAI GPT-4 Vision API Configuration (Primary)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_URL = 'https://api.openai.com/v1';
+
+// Google Gemini API Configuration (Fallback)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// Try multiple model endpoints - some API keys work with different versions
 const GEMINI_MODELS = [
   'gemini-1.5-flash-latest',
   'gemini-1.5-flash',
@@ -32,9 +35,6 @@ const GEMINI_MODELS = [
 // Anthropic Claude API Configuration (Fallback)
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_API_URL = 'https://api.anthropic.com';
-
-// MiniMax API Configuration (Fallback)
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 
 // Supabase Configuration
 const supabaseUrl = process.env.SUPABASE_URL || 'https://euprioekychumqtxehzd.supabase.co';
@@ -119,11 +119,11 @@ app.get('/api/health', async (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    version: '5.0.0',
+    version: '6.0.0',
     database: dbStatus,
+    gpt4VisionEnabled: !!OPENAI_API_KEY,
     geminiEnabled: !!GEMINI_API_KEY,
     claudeEnabled: !!ANTHROPIC_API_KEY,
-    minimaxEnabled: !!MINIMAX_API_KEY,
     stats
   });
 });
@@ -144,7 +144,30 @@ app.post('/api/analyze', async (req, res) => {
   console.log(`[${analysisId}] Starting analysis...`);
 
   try {
-    // Try Gemini Vision first (Primary)
+    // Try GPT-4 Vision first (Primary)
+    if (OPENAI_API_KEY) {
+      console.log(`[${analysisId}] Trying GPT-4 Vision...`);
+      const aiResult = await callGPT4Vision(image, analysisId);
+
+      if (aiResult) {
+        if (supabase) {
+          await saveToDatabase(analysisId, fileName, aiResult);
+        }
+
+        return res.json({
+          ...aiResult,
+          id: analysisId,
+          metadata: {
+            ...aiResult.metadata,
+            processingTime: Date.now() - startTime,
+            databaseSaved: !!supabase,
+            aiProvider: 'GPT-4 Vision'
+          }
+        });
+      }
+    }
+
+    // Try Gemini Vision as fallback
     if (GEMINI_API_KEY) {
       console.log(`[${analysisId}] Trying Gemini Vision...`);
       const aiResult = await callGeminiVision(image, analysisId);
@@ -223,11 +246,11 @@ app.post('/api/analyze', async (req, res) => {
 });
 
 // =============================================
-// GEMINI VISION API CALL (Primary)
+// GPT-4 VISION API CALL (Primary)
 // =============================================
-async function callGeminiVision(imageData, analysisId) {
-  if (!GEMINI_API_KEY) {
-    throw new Error('Gemini API key not configured');
+async function callGPT4Vision(imageData, analysisId) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OpenAI API key not configured');
   }
 
   // Extract base64 data
@@ -236,9 +259,76 @@ async function callGeminiVision(imageData, analysisId) {
     base64Image = imageData.split(',')[1];
   }
 
+  console.log(`[${analysisId}] Calling GPT-4 Vision API...`);
+
+  try {
+    const response = await fetch(`${OPENAI_API_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: ANALYSIS_PROMPT
+              },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Image}`
+                }
+              }
+            ]
+          }
+        ],
+        max_tokens: 8192
+      })
+    });
+
+    console.log(`[${analysisId}] GPT-4 response status:`, response.status);
+
+    if (response.ok) {
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content || '';
+
+      if (content) {
+        console.log(`[${analysisId}] GPT-4 Vision response received`);
+        return parseAIResponse(content, 'GPT-4 Vision');
+      }
+    } else {
+      const errorText = await response.text();
+      console.log(`[${analysisId}] GPT-4 API error: ${errorText}`);
+      throw new Error(`GPT-4 API failed: ${response.status}`);
+    }
+  } catch (e) {
+    console.error(`[${analysisId}] GPT-4 Vision error:`, e.message);
+    throw e;
+  }
+
+  return null;
+}
+
+// =============================================
+// GEMINI VISION API CALL (Fallback)
+// =============================================
+async function callGeminiVision(imageData, analysisId) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('Gemini API key not configured');
+  }
+
+  let base64Image = imageData;
+  if (imageData.includes(',')) {
+    base64Image = imageData.split(',')[1];
+  }
+
   const baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-  // Try each model until one works
   for (const model of GEMINI_MODELS) {
     console.log(`[${analysisId}] Trying Gemini model: ${model}`);
 
@@ -247,27 +337,15 @@ async function callGeminiVision(imageData, analysisId) {
         `${baseUrl}/${model}:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{
               parts: [
-                {
-                  inlineData: {
-                    mimeType: 'image/jpeg',
-                    data: base64Image
-                  }
-                },
-                {
-                  text: ANALYSIS_PROMPT
-                }
+                { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+                { text: ANALYSIS_PROMPT }
               ]
             }],
-            generationConfig: {
-              temperature: 0.1,
-              maxOutputTokens: 8192
-            }
+            generationConfig: { temperature: 0.1, maxOutputTokens: 8192 }
           })
         }
       );
@@ -277,22 +355,17 @@ async function callGeminiVision(imageData, analysisId) {
       if (response.ok) {
         const data = await response.json();
         const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
         if (content) {
-          console.log(`[${analysisId}] Gemini Vision response received from ${model}`);
+          console.log(`[${analysisId}] Gemini Vision response received`);
           return parseAIResponse(content, `Gemini Vision (${model})`);
         }
       } else {
         const errorText = await response.text();
         const errorData = JSON.parse(errorText);
-
-        // If model not found, try next model
         if (errorData.error?.code === 404) {
           console.log(`[${analysisId}] Model ${model} not found, trying next...`);
           continue;
         }
-
-        // For other errors, log and continue to next model
         console.log(`[${analysisId}] ${model} error: ${errorText}`);
         continue;
       }
@@ -302,7 +375,6 @@ async function callGeminiVision(imageData, analysisId) {
     }
   }
 
-  // All models failed
   throw new Error('All Gemini models failed');
 }
 
@@ -314,7 +386,6 @@ async function callClaudeVision(imageData, analysisId) {
     throw new Error('Claude API key not configured');
   }
 
-  // Extract base64 data
   let base64Image = imageData;
   if (imageData.includes(',')) {
     base64Image = imageData.split(',')[1];
@@ -337,18 +408,8 @@ async function callClaudeVision(imageData, analysisId) {
         messages: [{
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: 'image/jpeg',
-                data: base64Image
-              }
-            },
-            {
-              type: 'text',
-              text: ANALYSIS_PROMPT
-            }
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+            { type: 'text', text: ANALYSIS_PROMPT }
           ]
         }]
       })
@@ -359,7 +420,6 @@ async function callClaudeVision(imageData, analysisId) {
     if (response.ok) {
       const data = await response.json();
       const content = data.content?.[0]?.text || '';
-
       if (content) {
         console.log(`[${analysisId}] Claude Vision response received`);
         return parseAIResponse(content, 'Claude Vision');
@@ -386,95 +446,56 @@ function parseAIResponse(aiResponse, provider) {
   const mediumRisk = new Set();
   const safe = new Set();
 
-  // Extract IDs from summary
   const suicideHighMatch = aiResponse.match(/【SUICIDE[\/／]HIGH[\-\-]RISK IDs】[：:]\s*(.+?)(?=\n|——|$)/i);
   const mediumMatch = aiResponse.match(/【MEDIUM[\-\-]RISK IDs】[：:]\s*(.+?)(?=\n|——|$)/i);
   const safeMatch = aiResponse.match(/【SAFE IDs】[：:]\s*(.+?)(?=\n|——|$)/i);
 
-  // Parse suicide/high risks
   if (suicideHighMatch) {
     const ids = suicideHighMatch[1].split(/[,，、\s]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s));
     ids.forEach(id => {
       suicideHighRisk.add(id);
-      allRisks.push({
-        id,
-        riskLevel: 'high',
-        violation: 'IP侵权风险',
-        details: '详见AI分析报告',
-        category: categorizeText(aiResponse, id)
-      });
+      allRisks.push({ id, riskLevel: 'high', violation: 'IP侵权风险', details: '详见AI分析报告', category: categorizeText(aiResponse, id) });
     });
   }
 
-  // Parse medium risks
   if (mediumMatch) {
     const ids = mediumMatch[1].split(/[,，、\s]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s));
     ids.forEach(id => {
       mediumRisk.add(id);
-      allRisks.push({
-        id,
-        riskLevel: 'medium',
-        violation: '中危风险',
-        details: '建议修改后上架',
-        category: 'generic'
-      });
+      allRisks.push({ id, riskLevel: 'medium', violation: '中危风险', details: '建议修改后上架', category: 'generic' });
     });
   }
 
-  // Parse safe IDs
   if (safeMatch) {
     const ids = safeMatch[1].split(/[,，、\s]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s));
     ids.forEach(id => safe.add(id));
   }
 
-  // Parse detailed sections
   const detailMatches = aiResponse.matchAll(/\[(\d+)\][：:]\s*(?:Risk Level: )?([^\n]+)/gi);
   for (const match of detailMatches) {
     const id = match[1];
     const section = match[0];
-
     let riskLevel = 'medium';
     if (/suicide/i.test(section)) riskLevel = 'suicide';
     else if (/high/i.test(section)) riskLevel = 'high';
     else if (/medium/i.test(section)) riskLevel = 'medium';
-    else if (/safe/i.test(section)) {
-      safe.add(id);
-      continue;
-    }
+    else if (/safe/i.test(section)) { safe.add(id); continue; }
 
     const violationMatch = section.match(/[Vv]iolation[\s-]*[Tt]ype[：:]\s*(.+?)(?:\n|$)/i);
     const detailsMatch = section.match(/[Dd]etails?[：:]\s*(.+?)(?:\n|$)/i);
 
-    // Update existing or add new
     const existingIdx = allRisks.findIndex(r => r.id === id);
     if (existingIdx >= 0) {
-      allRisks[existingIdx] = {
-        ...allRisks[existingIdx],
-        violation: violationMatch?.[1] || allRisks[existingIdx].violation,
-        details: detailsMatch?.[1] || allRisks[existingIdx].details,
-        riskLevel: riskLevel === 'suicide' ? 'suicide' : allRisks[existingIdx].riskLevel
-      };
+      allRisks[existingIdx] = { ...allRisks[existingIdx], violation: violationMatch?.[1] || allRisks[existingIdx].violation, details: detailsMatch?.[1] || allRisks[existingIdx].details, riskLevel: riskLevel === 'suicide' ? 'suicide' : allRisks[existingIdx].riskLevel };
     } else {
-      allRisks.push({
-        id,
-        riskLevel,
-        violation: violationMatch?.[1] || 'IP侵权风险',
-        details: detailsMatch?.[1] || '详见分析报告',
-        category: categorizeText(section, id)
-      });
+      allRisks.push({ id, riskLevel, violation: violationMatch?.[1] || 'IP侵权风险', details: detailsMatch?.[1] || '详见分析报告', category: categorizeText(section, id) });
     }
 
-    // Update sets
-    if (riskLevel === 'suicide' || riskLevel === 'high') {
-      suicideHighRisk.add(id);
-      mediumRisk.delete(id);
-    } else {
-      mediumRisk.add(id);
-    }
+    if (riskLevel === 'suicide' || riskLevel === 'high') { suicideHighRisk.add(id); mediumRisk.delete(id); }
+    else { mediumRisk.add(id); }
     safe.delete(id);
   }
 
-  // Calculate breakdown
   const breakdown = {
     trademark: allRisks.filter(r => r.category === 'trademark').length,
     copyright: allRisks.filter(r => r.category === 'copyright').length,
@@ -496,27 +517,14 @@ function parseAIResponse(aiResponse, provider) {
       if (b.riskLevel === 'high' && a.riskLevel === 'medium') return 1;
       return parseInt(a.id) - parseInt(b.id);
     }),
-    summary: {
-      total: suicideHighRisk.size + mediumRisk.size + safe.size,
-      highRiskCount: suicideHighRisk.size,
-      mediumRiskCount: mediumRisk.size,
-      safeCount: safe.size,
-      breakdown
-    },
-    metadata: {
-      analyzedAt: new Date().toISOString(),
-      processingTime: 0,
-      analysisVersion: '5.0.0',
-      aiProvider: provider
-    },
+    summary: { total: suicideHighRisk.size + mediumRisk.size + safe.size, highRiskCount: suicideHighRisk.size, mediumRiskCount: mediumRisk.size, safeCount: safe.size, breakdown },
+    metadata: { analyzedAt: new Date().toISOString(), processingTime: 0, analysisVersion: '6.0.0', aiProvider: provider },
     rawAnalysis: aiResponse
   };
 }
 
-// Categorize violation type
 function categorizeText(text, id) {
   const lower = text.toLowerCase();
-
   if (/trademark|品牌|商标|logo|标志/i.test(lower)) return 'trademark';
   if (/copyright|版权|角色|character|动漫|movie|film/i.test(lower)) return 'copyright';
   if (/celebrity|名人|肖像|portrait/i.test(lower)) return 'celebrity';
@@ -524,7 +532,6 @@ function categorizeText(text, id) {
   if (/violence|暴力|weapon|gun/i.test(lower)) return 'violence';
   if (/hate|仇恨|nazi|种族/i.test(lower)) return 'hate';
   if (/profanity|脏话|脏字|vulgar/i.test(lower)) return 'adult';
-
   return 'generic';
 }
 
@@ -551,28 +558,8 @@ function generateFallbackResult() {
       { id: '33', riskLevel: 'high', violation: '版权侵权', details: '电影版权内容', category: 'copyright' },
       { id: '45', riskLevel: 'medium', violation: '政治敏感', details: '国旗图案', category: 'politics' }
     ],
-    summary: {
-      total: 50,
-      highRiskCount: 10,
-      mediumRiskCount: 3,
-      safeCount: 37,
-      breakdown: {
-        trademark: 2,
-        copyright: 6,
-        celebrity: 2,
-        politics: 2,
-        violence: 1,
-        hate: 0,
-        adult: 0
-      }
-    },
-    metadata: {
-      analyzedAt: new Date().toISOString(),
-      processingTime: 0,
-      analysisVersion: '5.0.0',
-      aiProvider: 'Demo',
-      demoMode: true
-    }
+    summary: { total: 50, highRiskCount: 10, mediumRiskCount: 3, safeCount: 37, breakdown: { trademark: 2, copyright: 6, celebrity: 2, politics: 2, violence: 1, hate: 0, adult: 0 } },
+    metadata: { analyzedAt: new Date().toISOString(), processingTime: 0, analysisVersion: '6.0.0', aiProvider: 'Demo', demoMode: true }
   };
 }
 
@@ -581,127 +568,55 @@ function generateFallbackResult() {
 // =============================================
 async function saveToDatabase(analysisId, fileName, result) {
   if (!supabase) return;
-
   try {
-    const { error } = await supabase.from('analysis_history').insert({
-      id: analysisId,
-      file_name: fileName || 'unknown',
-      result: result
-    });
-
-    if (error) {
-      console.log('Database save error:', error.message);
-    } else {
-      console.log(`[${analysisId}] Saved to database`);
-    }
-  } catch (e) {
-    console.log('Database error:', e.message);
-  }
+    const { error } = await supabase.from('analysis_history').insert({ id: analysisId, file_name: fileName || 'unknown', result: result });
+    if (error) { console.log('Database save error:', error.message); }
+    else { console.log(`[${analysisId}] Saved to database`); }
+  } catch (e) { console.log('Database error:', e.message); }
 }
 
 // =============================================
 // HISTORY ROUTES
 // =============================================
 app.get('/api/history', async (req, res) => {
-  if (!supabase) {
-    return res.json({ total: 0, items: [], limit: 20, offset: 0 });
-  }
-
+  if (!supabase) return res.json({ total: 0, items: [], limit: 20, offset: 0 });
   try {
     const limit = parseInt(req.query.limit) || 20;
     const offset = parseInt(req.query.offset) || 0;
-
-    const { data, count, error } = await supabase
-      .from('analysis_history')
-      .select('id, file_name, created_at, result')
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-
+    const { data, count, error } = await supabase.from('analysis_history').select('id, file_name, created_at, result').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-
-    const items = (data || []).map(item => ({
-      id: item.id,
-      file_name: item.file_name,
-      created_at: item.created_at,
-      summary: item.result?.summary || {}
-    }));
-
+    const items = (data || []).map(item => ({ id: item.id, file_name: item.file_name, created_at: item.created_at, summary: item.result?.summary || {} }));
     res.json({ total: count || 0, items, limit, offset });
-  } catch (error) {
-    console.error('History error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { console.error('History error:', error); res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/analysis/:id', async (req, res) => {
-  if (!supabase) {
-    return res.status(404).json({ error: 'Database not configured' });
-  }
-
+  if (!supabase) return res.status(404).json({ error: 'Database not configured' });
   try {
-    const { data, error } = await supabase
-      .from('analysis_history')
-      .select('result')
-      .eq('id', req.params.id)
-      .single();
-
+    const { data, error } = await supabase.from('analysis_history').select('result').eq('id', req.params.id).single();
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Not found' });
-
     res.json(data.result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.delete('/api/analysis/:id', async (req, res) => {
-  if (!supabase) {
-    return res.json({ success: true });
-  }
-
-  try {
-    await supabase.from('analysis_history').delete().eq('id', req.params.id);
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  if (!supabase) return res.json({ success: true });
+  try { await supabase.from('analysis_history').delete().eq('id', req.params.id); res.json({ success: true }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.delete('/api/history', async (req, res) => {
-  if (!supabase) {
-    return res.json({ success: true });
-  }
-
-  try {
-    await supabase.from('analysis_history').delete();
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  if (!supabase) return res.json({ success: true });
+  try { await supabase.from('analysis_history').delete(); res.json({ success: true }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/stats', async (req, res) => {
-  if (!supabase) {
-    return res.json({
-      totalAnalyses: 0,
-      totalProducts: 0,
-      totalHighRisk: 0,
-      totalMediumRisk: 0,
-      totalSafe: 0
-    });
-  }
-
+  if (!supabase) return res.json({ totalAnalyses: 0, totalProducts: 0, totalHighRisk: 0, totalMediumRisk: 0, totalSafe: 0 });
   try {
     const { data } = await supabase.from('analysis_history').select('result');
-
-    const stats = {
-      totalAnalyses: data?.length || 0,
-      totalProducts: 0,
-      totalHighRisk: 0,
-      totalMediumRisk: 0,
-      totalSafe: 0
-    };
-
+    const stats = { totalAnalyses: data?.length || 0, totalProducts: 0, totalHighRisk: 0, totalMediumRisk: 0, totalSafe: 0 };
     data?.forEach(item => {
       if (item.result?.summary) {
         stats.totalProducts += item.result.summary.total || 0;
@@ -710,11 +625,8 @@ app.get('/api/stats', async (req, res) => {
         stats.totalSafe += item.result.summary.safeCount || 0;
       }
     });
-
     res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 // =============================================
@@ -722,8 +634,8 @@ app.get('/api/stats', async (req, res) => {
 // =============================================
 app.listen(PORT, () => {
   console.log(`🚀 Walmart IP Scanner API running on port ${PORT}`);
+  console.log(`   GPT-4 Vision: ${OPENAI_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
   console.log(`   Gemini Vision: ${GEMINI_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
   console.log(`   Claude Vision: ${ANTHROPIC_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
-  console.log(`   MiniMax: ${MINIMAX_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
   console.log(`   Database: ${supabase ? '✅ Connected' : '❌ Disconnected'}`);
 });
