@@ -1,5 +1,5 @@
-// Walmart IP Scanner - Backend Server with Claude Vision + MiniMax Proxy
-// Supports both Claude Vision and MiniMax for image analysis
+// Walmart IP Scanner - Backend Server with Gemini Vision + Claude + MiniMax Proxy
+// Supports Gemini Vision (primary), Claude Vision, and MiniMax for image analysis
 
 import express from 'express';
 import cors from 'cors';
@@ -18,20 +18,23 @@ const PORT = process.env.PORT || 3001;
 // CONFIGURATION
 // =============================================
 
-// Anthropic Claude API Configuration
+// Google Gemini API Configuration (Primary)
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash';
+
+// Anthropic Claude API Configuration (Fallback)
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_API_URL = 'https://api.anthropic.com';
 
-// MiniMax API Configuration (fallback)
+// MiniMax API Configuration (Fallback)
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
-const MINIMAX_API_BASE = 'https://api.minimax.chat/v1';
 
 // Supabase Configuration
 const supabaseUrl = process.env.SUPABASE_URL || 'https://euprioekychumqtxehzd.supabase.co';
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 const supabase = supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
-// Analysis Prompt for Claude
+// Analysis Prompt for AI
 const ANALYSIS_PROMPT = `You are an expert in US Intellectual Property Law and Walmart Marketplace compliance policies.
 
 Analyze this POD (Print on Demand) product image for Walmart US Category 025 (Clothing/Shoes).
@@ -109,8 +112,9 @@ app.get('/api/health', async (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    version: '4.0.0',
+    version: '5.0.0',
     database: dbStatus,
+    geminiEnabled: !!GEMINI_API_KEY,
     claudeEnabled: !!ANTHROPIC_API_KEY,
     minimaxEnabled: !!MINIMAX_API_KEY,
     stats
@@ -133,7 +137,30 @@ app.post('/api/analyze', async (req, res) => {
   console.log(`[${analysisId}] Starting analysis...`);
 
   try {
-    // Try Claude Vision first (preferred)
+    // Try Gemini Vision first (Primary)
+    if (GEMINI_API_KEY) {
+      console.log(`[${analysisId}] Trying Gemini Vision...`);
+      const aiResult = await callGeminiVision(image, analysisId);
+
+      if (aiResult) {
+        if (supabase) {
+          await saveToDatabase(analysisId, fileName, aiResult);
+        }
+
+        return res.json({
+          ...aiResult,
+          id: analysisId,
+          metadata: {
+            ...aiResult.metadata,
+            processingTime: Date.now() - startTime,
+            databaseSaved: !!supabase,
+            aiProvider: 'Gemini Vision'
+          }
+        });
+      }
+    }
+
+    // Try Claude Vision as fallback
     if (ANTHROPIC_API_KEY) {
       console.log(`[${analysisId}] Trying Claude Vision...`);
       const aiResult = await callClaudeVision(image, analysisId);
@@ -154,27 +181,6 @@ app.post('/api/analyze', async (req, res) => {
           }
         });
       }
-    }
-
-    // Try MiniMax as fallback
-    if (MINIMAX_API_KEY) {
-      console.log(`[${analysisId}] Trying MiniMax...`);
-      const aiResult = await callMiniMaxAI(image, analysisId);
-
-      if (supabase) {
-        await saveToDatabase(analysisId, fileName, aiResult);
-      }
-
-      return res.json({
-        ...aiResult,
-        id: analysisId,
-        metadata: {
-          ...aiResult.metadata,
-          processingTime: Date.now() - startTime,
-          databaseSaved: !!supabase,
-          aiProvider: 'MiniMax'
-        }
-      });
     }
 
     // Fallback to demo data
@@ -210,7 +216,76 @@ app.post('/api/analyze', async (req, res) => {
 });
 
 // =============================================
-// CLAUDE VISION API CALL
+// GEMINI VISION API CALL (Primary)
+// =============================================
+async function callGeminiVision(imageData, analysisId) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('Gemini API key not configured');
+  }
+
+  // Extract base64 data
+  let base64Image = imageData;
+  if (imageData.includes(',')) {
+    base64Image = imageData.split(',')[1];
+  }
+
+  console.log(`[${analysisId}] Calling Gemini Vision API...`);
+
+  try {
+    const response = await fetch(
+      `${GEMINI_API_URL}:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              {
+                inlineData: {
+                  mimeType: 'image/jpeg',
+                  data: base64Image
+                }
+              },
+              {
+                text: ANALYSIS_PROMPT
+              }
+            ]
+          }],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 8192
+          }
+        })
+      }
+    );
+
+    console.log(`[${analysisId}] Gemini response status:`, response.status);
+
+    if (response.ok) {
+      const data = await response.json();
+      const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+      if (content) {
+        console.log(`[${analysisId}] Gemini Vision response received`);
+        return parseAIResponse(content, 'Gemini Vision');
+      }
+    } else {
+      const errorText = await response.text();
+      console.log(`[${analysisId}] Gemini API error: ${errorText}`);
+      throw new Error(`Gemini API failed: ${response.status}`);
+    }
+  } catch (e) {
+    console.error(`[${analysisId}] Gemini Vision error:`, e.message);
+    throw e;
+  }
+
+  return null;
+}
+
+// =============================================
+// CLAUDE VISION API CALL (Fallback)
 // =============================================
 async function callClaudeVision(imageData, analysisId) {
   if (!ANTHROPIC_API_KEY) {
@@ -265,7 +340,7 @@ async function callClaudeVision(imageData, analysisId) {
 
       if (content) {
         console.log(`[${analysisId}] Claude Vision response received`);
-        return parseAIResponse(content);
+        return parseAIResponse(content, 'Claude Vision');
       }
     } else {
       const errorText = await response.text();
@@ -281,22 +356,9 @@ async function callClaudeVision(imageData, analysisId) {
 }
 
 // =============================================
-// MINIMAX AI CALL (FALLBACK)
-// =============================================
-async function callMiniMaxAI(imageData, analysisId) {
-  if (!MINIMAX_API_KEY) {
-    throw new Error('MiniMax API key not configured');
-  }
-
-  // MiniMax text API doesn't support images, use demo data
-  console.log(`[${analysisId}] MiniMax doesn't support images, using demo data`);
-  return generateFallbackResult();
-}
-
-// =============================================
 // PARSE AI RESPONSE
 // =============================================
-function parseAIResponse(aiResponse) {
+function parseAIResponse(aiResponse, provider) {
   const allRisks = [];
   const suicideHighRisk = new Set();
   const mediumRisk = new Set();
@@ -422,8 +484,8 @@ function parseAIResponse(aiResponse) {
     metadata: {
       analyzedAt: new Date().toISOString(),
       processingTime: 0,
-      analysisVersion: '4.0.0',
-      aiProvider: 'Claude Vision'
+      analysisVersion: '5.0.0',
+      aiProvider: provider
     },
     rawAnalysis: aiResponse
   };
@@ -485,7 +547,7 @@ function generateFallbackResult() {
     metadata: {
       analyzedAt: new Date().toISOString(),
       processingTime: 0,
-      analysisVersion: '4.0.0',
+      analysisVersion: '5.0.0',
       aiProvider: 'Demo',
       demoMode: true
     }
@@ -512,16 +574,6 @@ async function saveToDatabase(analysisId, fileName, result) {
     }
   } catch (e) {
     console.log('Database error:', e.message);
-  }
-}
-
-async function checkDatabase() {
-  if (!supabase) return false;
-  try {
-    const { error } = await supabase.from('analysis_history').select('id').limit(1);
-    return !error;
-  } catch {
-    return false;
   }
 }
 
@@ -648,6 +700,7 @@ app.get('/api/stats', async (req, res) => {
 // =============================================
 app.listen(PORT, () => {
   console.log(`🚀 Walmart IP Scanner API running on port ${PORT}`);
+  console.log(`   Gemini Vision: ${GEMINI_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
   console.log(`   Claude Vision: ${ANTHROPIC_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
   console.log(`   MiniMax: ${MINIMAX_API_KEY ? '✅ Enabled' : '❌ Disabled'}`);
   console.log(`   Database: ${supabase ? '✅ Connected' : '❌ Disconnected'}`);
